@@ -10,10 +10,10 @@ Work from the project root:
 cd /Users/ever/Desktop/work/codex/bayes_llm
 ```
 
-Install a CUDA-enabled PyTorch build for your machine using the PyTorch install selector. Then install this package:
+Install a CUDA-enabled PyTorch build for your machine using the PyTorch install selector. Then install this package with Hugging Face support:
 
 ```bash
-pip install -e .
+pip install -e ".[hf]"
 ```
 
 If you do not install the package, prefix commands with:
@@ -26,7 +26,7 @@ export PYTHONPATH="src${PYTHONPATH:+:$PYTHONPATH}"
 
 ### `examples/smoke_cpu.sh`
 
-Runs the unit tests and a two-step CPU training job. Use this before launching GPU jobs:
+Runs the unit tests and a two-step CPU training job. This smoke test uses the tiny scratch model path so it does not download Qwen on machines without `transformers`.
 
 ```bash
 bash examples/smoke_cpu.sh
@@ -45,7 +45,7 @@ PYTHON=/path/to/python bash examples/smoke_cpu.sh
 Runs the core task/model grid:
 
 - tasks: `exchangeable`, `random_walk`, `changepoint`
-- models: `regular`, `set`, `adaptive`
+- models: `qwen`, `qwen_set`, `qwen_adaptive`
 
 Default command:
 
@@ -62,16 +62,25 @@ PYTHON=/path/to/python bash examples/run_gpu_matrix.sh
 Useful overrides:
 
 ```bash
-STEPS=20000 BATCH_SIZE=1024 CONTEXT=64 AMP=bf16 COMPILE=1 \
+STEPS=20000 BATCH_SIZE=64 CONTEXT=32 AMP=bf16 COMPILE=1 \
   bash examples/run_gpu_matrix.sh
 ```
 
 Run only one task/model pair:
 
 ```bash
-TASKS="random_walk" MODELS="adaptive" OUT_ROOT="artifacts/random_walk_only" \
+TASKS="random_walk" MODELS="qwen_adaptive" OUT_ROOT="artifacts/random_walk_only" \
   bash examples/run_gpu_matrix.sh
 ```
+
+Select a different small Hugging Face backbone:
+
+```bash
+HF_MODEL_ID="Qwen/Qwen3-0.6B" TASKS="exchangeable" MODELS="qwen" \
+  bash examples/run_gpu_matrix.sh
+```
+
+By default, `examples/run_gpu_matrix.sh` sets `FREEZE_BACKBONE=1`, so it trains only numeric adapters, regression heads, and the adaptive gate. Set `FREEZE_BACKBONE=0` to fine-tune the whole pretrained model.
 
 Outputs go under `artifacts/gpu_matrix/<task>_<model>/` by default.
 
@@ -88,24 +97,25 @@ Example:
 ```bash
 python -m bayes_llm.train \
   --task random_walk \
-  --model adaptive \
+  --model qwen_adaptive \
+  --hf-model-id Qwen/Qwen2.5-0.5B \
   --device cuda \
   --amp bf16 \
   --compile \
   --steps 5000 \
-  --batch-size 512 \
-  --context 32 \
+  --batch-size 32 \
+  --context 16 \
   --x-dim 8 \
-  --hidden-dim 128 \
-  --n-heads 4 \
-  --n-layers 2 \
+  --freeze-backbone \
   --out-dir artifacts/random_walk_adaptive
 ```
 
 Important flags:
 
 - `--task`: `exchangeable`, `random_walk`, `changepoint`, or `heteroscedastic`.
-- `--model`: `regular`, `set`, `set_llm`, or `adaptive`.
+- `--model`: use `qwen`, `qwen_set`, or `qwen_adaptive` for pretrained experiments; `regular`, `set`, and `adaptive` are scratch ablations.
+- `--hf-model-id`: Hugging Face model id for pretrained backbones; default is `Qwen/Qwen2.5-0.5B`.
+- `--freeze-backbone`: freeze the pretrained Qwen/HF transformer and train only adapters/heads/gate.
 - `--device`: `cuda`, `cpu`, `mps`, or `auto`.
 - `--amp`: `bf16`, `fp16`, or `off`; use `bf16` first on modern GPUs.
 - `--compile`: enables `torch.compile`.
@@ -155,9 +165,12 @@ These are used for oracle mean/variance distance and KL-style diagnostics.
 
 Defines the model baselines:
 
-- `PositionAwareTransformerRegressor`: regular ordered transformer with learned between-example positions.
-- `SetLLMStyleInvariantRegressor`: Set-LLM-style invariant branch. It uses shared within-example positions and invariant pooling, so paired context permutations produce the same prediction.
-- `AdaptiveTwoBranchRegressor`: combines set and ordered branches with a learned gate `gate_alpha`.
+- `PretrainedOrderedRegressor`: ordered pretrained Qwen/HF decoder backbone, selected by `--model qwen`.
+- `PretrainedSetRegressor`: pretrained Qwen/HF backbone applied per example with invariant pooling, selected by `--model qwen_set`.
+- `PretrainedAdaptiveRegressor`: shared pretrained Qwen/HF backbone with set and ordered paths plus `gate_alpha`, selected by `--model qwen_adaptive`.
+- `PositionAwareTransformerRegressor`, `SetLLMStyleInvariantRegressor`, and `AdaptiveTwoBranchRegressor`: scratch ablations only.
+
+The pretrained models do not serialize tensors into text. They feed learned numeric prompt embeddings through `AutoModel.from_pretrained(...)` via `inputs_embeds`, reusing the pretrained transformer weights while training small numeric adapters and regression heads.
 
 All models expose:
 
@@ -200,12 +213,14 @@ First verify exchangeable invariance:
 ```bash
 python -m bayes_llm.train \
   --task exchangeable \
-  --model set \
+  --model qwen_set \
+  --hf-model-id Qwen/Qwen2.5-0.5B \
   --device cuda \
   --amp bf16 \
   --steps 3000 \
-  --batch-size 512 \
-  --context 32 \
+  --batch-size 32 \
+  --context 16 \
+  --freeze-backbone \
   --out-dir artifacts/exchangeable_set
 ```
 
@@ -214,12 +229,14 @@ Then compare against the ordered baseline on drift:
 ```bash
 python -m bayes_llm.train \
   --task random_walk \
-  --model regular \
+  --model qwen \
+  --hf-model-id Qwen/Qwen2.5-0.5B \
   --device cuda \
   --amp bf16 \
   --steps 3000 \
-  --batch-size 512 \
-  --context 32 \
+  --batch-size 32 \
+  --context 16 \
+  --freeze-backbone \
   --out-dir artifacts/random_walk_regular
 ```
 
@@ -228,17 +245,19 @@ Then run the adaptive model:
 ```bash
 python -m bayes_llm.train \
   --task random_walk \
-  --model adaptive \
+  --model qwen_adaptive \
+  --hf-model-id Qwen/Qwen2.5-0.5B \
   --device cuda \
   --amp bf16 \
   --steps 3000 \
-  --batch-size 512 \
-  --context 32 \
+  --batch-size 32 \
+  --context 16 \
+  --freeze-backbone \
   --out-dir artifacts/random_walk_adaptive
 ```
 
 Interpretation targets:
 
-- On `exchangeable`, `set` should have near-zero permutation gap.
-- On `random_walk` and `changepoint`, `regular` should have useful order sensitivity.
-- On mixed comparisons, `adaptive` should learn higher `gate_alpha` for exchangeable data and lower `gate_alpha` for ordered data.
+- On `exchangeable`, `qwen_set` should have near-zero permutation gap.
+- On `random_walk` and `changepoint`, `qwen` should have useful order sensitivity.
+- On mixed comparisons, `qwen_adaptive` should learn higher `gate_alpha` for exchangeable data and lower `gate_alpha` for ordered data.

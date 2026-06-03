@@ -18,20 +18,27 @@ fi
 DEVICE="${DEVICE:-cuda}"
 AMP="${AMP:-bf16}"
 STEPS="${STEPS:-5000}"
-BATCH_SIZE="${BATCH_SIZE:-512}"
-CONTEXT="${CONTEXT:-32}"
+BATCH_SIZE="${BATCH_SIZE:-32}"
+CONTEXT="${CONTEXT:-16}"
 X_DIM="${X_DIM:-8}"
 HIDDEN_DIM="${HIDDEN_DIM:-128}"
 N_HEADS="${N_HEADS:-4}"
 N_LAYERS="${N_LAYERS:-2}"
 OUT_ROOT="${OUT_ROOT:-artifacts/gpu_matrix}"
 TASKS="${TASKS:-exchangeable random_walk changepoint}"
-MODELS="${MODELS:-regular set adaptive}"
+MODELS="${MODELS:-qwen qwen_set qwen_adaptive}"
+HF_MODEL_ID="${HF_MODEL_ID:-Qwen/Qwen2.5-0.5B}"
+FREEZE_BACKBONE="${FREEZE_BACKBONE:-1}"
 COMPILE="${COMPILE:-0}"
 
 compile_flag=()
 if [[ "$COMPILE" == "1" ]]; then
   compile_flag=(--compile)
+fi
+
+freeze_flag=()
+if [[ "$FREEZE_BACKBONE" == "1" ]]; then
+  freeze_flag=(--freeze-backbone)
 fi
 
 for task in $TASKS; do
@@ -41,6 +48,7 @@ for task in $TASKS; do
     "$PYTHON_BIN" -m bayes_llm.train \
       --task "$task" \
       --model "$model" \
+      --hf-model-id "$HF_MODEL_ID" \
       --device "$DEVICE" \
       --amp "$AMP" \
       --steps "$STEPS" \
@@ -55,6 +63,7 @@ for task in $TASKS; do
       --n-eval-batches 8 \
       --n-permutations 8 \
       --out-dir "$out_dir" \
+      "${freeze_flag[@]}" \
       "${compile_flag[@]}"
   done
 done

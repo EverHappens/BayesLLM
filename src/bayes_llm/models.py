@@ -237,6 +237,210 @@ class AdaptiveTwoBranchRegressor(nn.Module):
         }
 
 
+def _load_hf_backbone(model_id: str, trust_remote_code: bool) -> nn.Module:
+    try:
+        from transformers import AutoModel
+    except ImportError as exc:
+        raise RuntimeError(
+            "Hugging Face pretrained models require transformers. "
+            "Install with `pip install -e '.[hf]'` or `pip install transformers`."
+        ) from exc
+    return AutoModel.from_pretrained(model_id, trust_remote_code=trust_remote_code)
+
+
+def _hidden_size(backbone: nn.Module) -> int:
+    config = getattr(backbone, "config", None)
+    for name in ("hidden_size", "n_embd", "d_model"):
+        value = getattr(config, name, None)
+        if value is not None:
+            return int(value)
+    raise ValueError("could not infer hidden size from Hugging Face backbone config")
+
+
+class PretrainedCausalBackboneEncoder(nn.Module):
+    """Numeric ICL encoder that reuses a pretrained decoder backbone."""
+
+    def __init__(
+        self,
+        x_dim: int,
+        model_id: str,
+        *,
+        freeze_backbone: bool = False,
+        trust_remote_code: bool = False,
+    ) -> None:
+        super().__init__()
+        self.backbone = _load_hf_backbone(model_id, trust_remote_code=trust_remote_code)
+        self.hidden_dim = _hidden_size(self.backbone)
+        self.example_adapter = nn.Linear(x_dim + 1, self.hidden_dim)
+        self.query_adapter = nn.Linear(x_dim, self.hidden_dim)
+        self.local_x_adapter = nn.Linear(x_dim, self.hidden_dim)
+        self.local_y_adapter = nn.Linear(1, self.hidden_dim)
+        self.ordered_example_marker = nn.Parameter(torch.zeros(self.hidden_dim))
+        self.ordered_query_marker = nn.Parameter(torch.zeros(self.hidden_dim))
+        self.local_position = nn.Parameter(torch.zeros(2, self.hidden_dim))
+        self.set_norm = nn.LayerNorm(self.hidden_dim)
+        self.query_norm = nn.LayerNorm(self.hidden_dim)
+        self.freeze_backbone = freeze_backbone
+        if freeze_backbone:
+            for parameter in self.backbone.parameters():
+                parameter.requires_grad_(False)
+            self.backbone.eval()
+
+    def train(self, mode: bool = True) -> "PretrainedCausalBackboneEncoder":
+        super().train(mode)
+        if self.freeze_backbone:
+            self.backbone.eval()
+        return self
+
+    def _run_backbone(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
+        attention_mask = torch.ones(
+            inputs_embeds.shape[:2],
+            dtype=torch.long,
+            device=inputs_embeds.device,
+        )
+        try:
+            outputs = self.backbone(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                use_cache=False,
+                return_dict=True,
+            )
+        except TypeError:
+            outputs = self.backbone(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                return_dict=True,
+            )
+        last_hidden = getattr(outputs, "last_hidden_state", None)
+        if last_hidden is None:
+            hidden_states = getattr(outputs, "hidden_states", None)
+            if hidden_states is None:
+                raise RuntimeError("Hugging Face backbone did not return hidden states")
+            last_hidden = hidden_states[-1]
+        return last_hidden
+
+    def encode_ordered(self, context_x: torch.Tensor, context_y: torch.Tensor, query_x: torch.Tensor) -> torch.Tensor:
+        examples = torch.cat([context_x, context_y.unsqueeze(-1)], dim=-1)
+        example_tokens = self.example_adapter(examples) + self.ordered_example_marker[None, None, :]
+        query_token = self.query_adapter(query_x).unsqueeze(1) + self.ordered_query_marker[None, None, :]
+        hidden = self._run_backbone(torch.cat([example_tokens, query_token], dim=1))
+        return hidden[:, -1]
+
+    def encode_query(self, query_x: torch.Tensor) -> torch.Tensor:
+        return self.query_norm(self.query_adapter(query_x))
+
+    def encode_set(self, context_x: torch.Tensor, context_y: torch.Tensor) -> torch.Tensor:
+        batch_size, n_context, _ = context_x.shape
+        x_token = self.local_x_adapter(context_x)
+        y_token = self.local_y_adapter(context_y.unsqueeze(-1))
+        local_tokens = torch.stack([x_token, y_token], dim=2)
+        local_tokens = local_tokens + self.local_position[None, None, :, :]
+        local_tokens = local_tokens.reshape(batch_size * n_context, 2, self.hidden_dim)
+        local_hidden = self._run_backbone(local_tokens).mean(dim=1)
+        example_hidden = local_hidden.reshape(batch_size, n_context, self.hidden_dim)
+        return self.set_norm(example_hidden.mean(dim=1))
+
+
+class PretrainedOrderedRegressor(nn.Module):
+    """Ordered regressor using a pretrained Qwen/HF decoder as the sequence backbone."""
+
+    def __init__(
+        self,
+        x_dim: int,
+        model_id: str = "Qwen/Qwen2.5-0.5B",
+        *,
+        freeze_backbone: bool = False,
+        trust_remote_code: bool = False,
+    ) -> None:
+        super().__init__()
+        self.encoder = PretrainedCausalBackboneEncoder(
+            x_dim,
+            model_id,
+            freeze_backbone=freeze_backbone,
+            trust_remote_code=trust_remote_code,
+        )
+        self.head = GaussianHead(self.encoder.hidden_dim)
+
+    def forward(self, context_x: torch.Tensor, context_y: torch.Tensor, query_x: torch.Tensor) -> dict[str, torch.Tensor]:
+        return self.head(self.encoder.encode_ordered(context_x, context_y, query_x))
+
+
+class PretrainedSetRegressor(nn.Module):
+    """Permutation-invariant regressor using a pretrained backbone per example."""
+
+    def __init__(
+        self,
+        x_dim: int,
+        model_id: str = "Qwen/Qwen2.5-0.5B",
+        *,
+        freeze_backbone: bool = False,
+        trust_remote_code: bool = False,
+    ) -> None:
+        super().__init__()
+        self.encoder = PretrainedCausalBackboneEncoder(
+            x_dim,
+            model_id,
+            freeze_backbone=freeze_backbone,
+            trust_remote_code=trust_remote_code,
+        )
+        self.head = GaussianHead(2 * self.encoder.hidden_dim)
+
+    def forward(self, context_x: torch.Tensor, context_y: torch.Tensor, query_x: torch.Tensor) -> dict[str, torch.Tensor]:
+        context = self.encoder.encode_set(context_x, context_y)
+        query = self.encoder.encode_query(query_x)
+        return self.head(torch.cat([context, query], dim=-1))
+
+
+class PretrainedAdaptiveRegressor(nn.Module):
+    """Adaptive set/ordered regressor with a shared pretrained Qwen/HF backbone."""
+
+    def __init__(
+        self,
+        x_dim: int,
+        model_id: str = "Qwen/Qwen2.5-0.5B",
+        *,
+        freeze_backbone: bool = False,
+        trust_remote_code: bool = False,
+    ) -> None:
+        super().__init__()
+        self.encoder = PretrainedCausalBackboneEncoder(
+            x_dim,
+            model_id,
+            freeze_backbone=freeze_backbone,
+            trust_remote_code=trust_remote_code,
+        )
+        hidden_dim = self.encoder.hidden_dim
+        self.set_head = GaussianHead(2 * hidden_dim)
+        self.ordered_head = GaussianHead(hidden_dim)
+        self.gate = nn.Sequential(
+            nn.Linear(3 * hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, context_x: torch.Tensor, context_y: torch.Tensor, query_x: torch.Tensor) -> dict[str, torch.Tensor]:
+        set_context = self.encoder.encode_set(context_x, context_y)
+        ordered_context = self.encoder.encode_ordered(context_x, context_y, query_x)
+        query = self.encoder.encode_query(query_x)
+        set_pred = self.set_head(torch.cat([set_context, query], dim=-1))
+        ordered_pred = self.ordered_head(ordered_context)
+        alpha = torch.sigmoid(self.gate(torch.cat([set_context, ordered_context, query], dim=-1))).squeeze(-1)
+        mean = alpha * set_pred["mean"] + (1.0 - alpha) * ordered_pred["mean"]
+        second_moment = alpha * (set_pred["variance"] + set_pred["mean"].square())
+        second_moment = second_moment + (1.0 - alpha) * (ordered_pred["variance"] + ordered_pred["mean"].square())
+        variance = (second_moment - mean.square()).clamp_min(1e-8)
+        return {
+            "mean": mean,
+            "variance": variance,
+            "log_variance": torch.log(variance),
+            "set_mean": set_pred["mean"],
+            "set_variance": set_pred["variance"],
+            "ordered_mean": ordered_pred["mean"],
+            "ordered_variance": ordered_pred["variance"],
+            "gate_alpha": alpha,
+        }
+
+
 @dataclass(frozen=True)
 class ModelConfig:
     model: str
@@ -246,10 +450,34 @@ class ModelConfig:
     n_layers: int = 2
     dropout: float = 0.0
     max_context: int = 256
+    hf_model_id: str = "Qwen/Qwen2.5-0.5B"
+    freeze_backbone: bool = False
+    trust_remote_code: bool = False
 
 
 def make_model(config: ModelConfig) -> nn.Module:
     name = config.model.replace("-", "_").lower()
+    if name in {"qwen", "hf", "pretrained", "pretrained_ordered"}:
+        return PretrainedOrderedRegressor(
+            config.x_dim,
+            model_id=config.hf_model_id,
+            freeze_backbone=config.freeze_backbone,
+            trust_remote_code=config.trust_remote_code,
+        )
+    if name in {"qwen_set", "hf_set", "pretrained_set"}:
+        return PretrainedSetRegressor(
+            config.x_dim,
+            model_id=config.hf_model_id,
+            freeze_backbone=config.freeze_backbone,
+            trust_remote_code=config.trust_remote_code,
+        )
+    if name in {"qwen_adaptive", "hf_adaptive", "pretrained_adaptive"}:
+        return PretrainedAdaptiveRegressor(
+            config.x_dim,
+            model_id=config.hf_model_id,
+            freeze_backbone=config.freeze_backbone,
+            trust_remote_code=config.trust_remote_code,
+        )
     if name in {"regular", "ordered", "position_aware", "transformer"}:
         return PositionAwareTransformerRegressor(
             config.x_dim,
@@ -277,4 +505,3 @@ def make_model(config: ModelConfig) -> nn.Module:
             max_context=config.max_context,
         )
     raise ValueError(f"unknown model: {config.model}")
-

@@ -41,7 +41,7 @@ Therefore, hard-coded invariant models can be Bayes-optimal under exchangeable p
 
 The model has:
 
-1. Shared local example encoder
+1. Shared local example encoder backed by a small pretrained model such as Qwen
 2. Set / invariant branch
 3. Ordered / sequence branch
 4. Adaptive gate
@@ -88,6 +88,10 @@ For regression, use a mixture of Gaussian predictions or mix means/variances car
 ## Important architecture distinction
 
 The local token/example encoder may preserve token order inside each example.
+
+Implementation note:
+
+Primary experiments should load a small pretrained Hugging Face/Qwen backbone rather than initializing transformer layers from scratch. Scratch set/ordered/adaptive transformers are useful only as ablations.
 
 Example order across demonstrations should be removed only in the set branch.
 
@@ -186,12 +190,13 @@ For exchangeable data, Bayesian predictive beliefs should satisfy martingale con
 
 Implement:
 
-1. Set-only model
-2. Ordered-only model
-3. Adaptive two-branch model
+1. Pretrained Qwen set-only model
+2. Pretrained Qwen ordered-only model
+3. Pretrained Qwen adaptive two-branch model
 4. Oracle-selected branch, if branch labels known
 5. Bayesian oracle
 6. Optional PFN baseline
+7. Scratch transformer ablations, clearly labeled as ablations
 
 ## Theoretical targets
 

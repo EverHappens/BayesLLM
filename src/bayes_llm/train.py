@@ -130,7 +130,26 @@ def evaluate(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train synthetic Bayesian ICL regressors.")
     parser.add_argument("--task", default="exchangeable", choices=["exchangeable", "random_walk", "changepoint", "heteroscedastic"])
-    parser.add_argument("--model", default="adaptive", choices=["regular", "ordered", "set", "set_llm", "adaptive"])
+    parser.add_argument(
+        "--model",
+        default="qwen_adaptive",
+        choices=[
+            "regular",
+            "ordered",
+            "set",
+            "set_llm",
+            "adaptive",
+            "qwen",
+            "qwen_set",
+            "qwen_adaptive",
+            "hf",
+            "hf_set",
+            "hf_adaptive",
+        ],
+    )
+    parser.add_argument("--hf-model-id", default="Qwen/Qwen2.5-0.5B")
+    parser.add_argument("--freeze-backbone", action="store_true")
+    parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
     parser.add_argument("--amp", default="off", choices=["off", "fp16", "bf16"])
     parser.add_argument("--compile", action="store_true", help="Wrap the model with torch.compile when available.")
@@ -177,6 +196,9 @@ def main(argv: list[str] | None = None) -> None:
             n_layers=args.n_layers,
             dropout=args.dropout,
             max_context=max(args.context, 1),
+            hf_model_id=args.hf_model_id,
+            freeze_backbone=args.freeze_backbone,
+            trust_remote_code=args.trust_remote_code,
         )
     ).to(device)
     if args.compile:
@@ -235,4 +257,3 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
-
