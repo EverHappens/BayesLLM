@@ -11,6 +11,9 @@ Recent papers such as:
 
 study ways to reduce position or order sensitivity in LLMs. Their common premise is that many prompts contain unordered elements, but LLMs serialize these elements into sequences, creating arbitrary order bias.
 
+Important distinction:
+Set-LLM is not itself an ICL paper. We use it as an architectural mechanism for permutation-invariant processing of set-valued prompt regions, then evaluate that mechanism in an ICL-style demonstration/query setup.
+
 Our project argues that this is only half of the story.
 
 Permutation invariance is not universally desirable. It is correct when the prompt examples are exchangeable, but wrong when the prompt examples come from an ordered data-generating process.
@@ -91,7 +94,7 @@ The local token/example encoder may preserve token order inside each example.
 
 Implementation note:
 
-Primary experiments should load a small pretrained Hugging Face/Qwen backbone rather than initializing transformer layers from scratch. Scratch set/ordered/adaptive transformers are useful only as ablations.
+Primary experiments should load a small pretrained Hugging Face/Qwen backbone rather than initializing transformer layers from scratch. The Set-LLM-style branch should be described as a Set-LLM-inspired architectural adaptation applied to ICL contexts, not as a direct reproduction of Set-LLM's original task setting. Scratch set/ordered/adaptive transformers are useful only as ablations.
 
 Example order across demonstrations should be removed only in the set branch.
 
@@ -155,6 +158,13 @@ Expected behavior:
 - model should learn whether recent examples are more or less reliable
 - useful for testing calibrated order sensitivity, not just recency bias
 
+### 5. GP function-learning families
+
+f ~ GP(0, k_theta)
+y_i = f(x_i) + eps_i
+
+Use RBF and Matern kernels to test smoothness inductive bias, following the error-versus-demonstrations framing of "In-Context Function Learning in Large Language Models".
+
 ## Metrics
 
 Use more than accuracy/MSE.
@@ -185,6 +195,10 @@ For probabilistic regression, compare predictive variance to oracle variance.
 6. Martingale-style Bayesian checks:
 
 For exchangeable data, Bayesian predictive beliefs should satisfy martingale consistency as more observations are revealed. Track predictive drift across growing prefixes and compare it against the oracle and model baselines.
+
+7. Learning curves:
+
+Plot analytical oracle error, 1-nearest-neighbor error, and each tested model's error as a function of the number of demonstrations. Use these plots to support claims about sample-efficiency and inductive bias.
 
 ## Baselines
 

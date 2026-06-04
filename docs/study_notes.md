@@ -8,7 +8,9 @@ The ordered tasks intentionally violate exchangeability. In random-walk regressi
 
 The primary experiment models use a small pretrained Hugging Face/Qwen decoder backbone, defaulting to `Qwen/Qwen2.5-0.5B`. Synthetic tensors are mapped into learned numeric prompt embeddings and passed to the pretrained backbone through `inputs_embeds`; the transformer weights are loaded from `AutoModel.from_pretrained(...)`, not initialized from scratch.
 
-The pretrained ordered baseline uses Qwen over the serialized example sequence. The pretrained set baseline applies the same Qwen backbone per example with shared local positions and invariant pooling. The pretrained adaptive model shares the Qwen backbone across ordered and set paths, then learns a gate between their Gaussian predictions. Scratch transformer models remain available only as controlled ablations.
+The pretrained ordered baseline uses Qwen over the serialized example sequence. The pretrained set baseline now uses a Set-LLM-style flat sequence `[x1, y1, ..., xN, yN, query]`, role embeddings, SetPE positions shared across demonstrations, and a SetMask that lets the query attend to all demonstrations while preventing set elements from encoding arbitrary demonstration order. Set-LLM itself is not an ICL method; here it supplies the permutation-invariant attention/positioning mechanism that we place inside an ICL demonstration/query protocol. The pretrained adaptive model shares the Qwen backbone across ordered and set paths, then learns a gate between their Gaussian predictions. Scratch transformer and DeepSets-style pretrained models remain available only as controlled ablations.
+
+The function-learning extension follows the evaluation style of "In-Context Function Learning in Large Language Models": plot prediction error against the number of demonstrations and compare trained models to principled references. Here the references are the analytical Bayesian oracle for each synthetic family and a 1-nearest-neighbor rule.
 
 The martingale perspective paper, "Is In-Context Learning in Large Language Models Bayesian? A Martingale Perspective" by Falck, Wang, and Holmes, motivates an additional diagnostic: for exchangeable data, Bayesian predictive beliefs should satisfy martingale-style consistency as more observations are revealed. The implemented `martingale_prediction_stats` reports sample-path predictive drift across growing prefixes. It is a practical diagnostic rather than a complete reproduction of the paper's LLM experiments.
 
@@ -19,9 +21,11 @@ Primary metrics:
 - Oracle mean/variance distance where an oracle is implemented.
 - Adaptive gate statistics.
 - Martingale-style predictive drift on exchangeable tasks.
+- Learning curves over the number of demonstrations, including analytical oracle and 1-NN references.
 
 Expected qualitative outcomes:
 
 - Exchangeable regression: Bayesian oracle and set branch should have near-zero permutation gap; adaptive gate should learn to favor the set branch.
 - Random-walk regression: order-aware model should outperform set-only; adaptive gate should learn to favor the ordered branch.
 - Changepoint regression: order-aware and adaptive models should handle recent-regime evidence better than set-only.
+- GP function families: smoothness/roughness of the kernel should change sample-efficiency and expose inductive bias in the pretrained models.

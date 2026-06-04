@@ -4,6 +4,8 @@ from dataclasses import dataclass
 
 import torch
 
+from bayes_llm.tasks import gp_kernel
+
 
 @dataclass(frozen=True)
 class OraclePrediction:
@@ -136,6 +138,39 @@ def changepoint_oracle_predict(
     return OraclePrediction(mean=mean, variance=variance)
 
 
+def gp_regression_predict(
+    context_x: torch.Tensor,
+    context_y: torch.Tensor,
+    query_x: torch.Tensor,
+    *,
+    kernel: str = "rbf",
+    amplitude: float = 1.0,
+    lengthscale: float = 1.0,
+    sigma: float = 0.05,
+) -> OraclePrediction:
+    """Exact GP posterior predictive for noisy scalar observations."""
+
+    batch_size, n_context, _ = context_x.shape
+    dtype = context_x.dtype
+    device = context_x.device
+    if n_context == 0:
+        mean = torch.zeros(batch_size, device=device, dtype=dtype)
+        variance = torch.full((batch_size,), amplitude**2 + sigma**2, device=device, dtype=dtype)
+        return OraclePrediction(mean=mean, variance=variance)
+
+    query = query_x.unsqueeze(1)
+    k_xx = gp_kernel(context_x, context_x, kernel=kernel, amplitude=amplitude, lengthscale=lengthscale)
+    eye = torch.eye(n_context, device=device, dtype=dtype).expand(batch_size, n_context, n_context)
+    k_xx = k_xx + (sigma**2 + 1e-6) * eye
+    k_xq = gp_kernel(context_x, query, kernel=kernel, amplitude=amplitude, lengthscale=lengthscale)
+    solved_y = torch.linalg.solve(k_xx, context_y.unsqueeze(-1)).squeeze(-1)
+    solved_k = torch.linalg.solve(k_xx, k_xq)
+    mean = torch.bmm(k_xq.transpose(1, 2), solved_y.unsqueeze(-1)).squeeze(-1).squeeze(-1)
+    latent_variance = amplitude**2 - torch.bmm(k_xq.transpose(1, 2), solved_k).squeeze(-1).squeeze(-1)
+    variance = (latent_variance + sigma**2).clamp_min(1e-12)
+    return OraclePrediction(mean=mean, variance=variance)
+
+
 def oracle_for_batch(
     context_x: torch.Tensor,
     context_y: torch.Tensor,
@@ -145,6 +180,8 @@ def oracle_for_batch(
     tau: float = 1.0,
     sigma: float = 0.1,
     q: float = 0.05,
+    gp_amplitude: float = 1.0,
+    gp_lengthscale: float = 1.0,
 ) -> OraclePrediction | None:
     normalized = task_name.replace("-", "_").lower()
     if normalized in {"exchangeable", "linear", "exchangeable_linear"}:
@@ -153,4 +190,34 @@ def oracle_for_batch(
         return random_walk_kalman_predict(context_x, context_y, query_x, tau=tau, sigma=sigma, q=q)
     if normalized in {"changepoint", "change_point"}:
         return changepoint_oracle_predict(context_x, context_y, query_x, tau=tau, sigma=sigma)
+    if normalized in {"gp", "gp_rbf"}:
+        return gp_regression_predict(
+            context_x,
+            context_y,
+            query_x,
+            kernel="rbf",
+            amplitude=gp_amplitude,
+            lengthscale=gp_lengthscale,
+            sigma=sigma,
+        )
+    if normalized in {"gp_matern12", "gp_exponential"}:
+        return gp_regression_predict(
+            context_x,
+            context_y,
+            query_x,
+            kernel="matern12",
+            amplitude=gp_amplitude,
+            lengthscale=gp_lengthscale,
+            sigma=sigma,
+        )
+    if normalized in {"gp_matern32"}:
+        return gp_regression_predict(
+            context_x,
+            context_y,
+            query_x,
+            kernel="matern32",
+            amplitude=gp_amplitude,
+            lengthscale=gp_lengthscale,
+            sigma=sigma,
+        )
     return None

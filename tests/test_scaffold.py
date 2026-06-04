@@ -10,11 +10,17 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from bayes_llm.metrics import gaussian_nll
-from bayes_llm.models import AdaptiveTwoBranchRegressor, SetLLMStyleInvariantRegressor
-from bayes_llm.oracles import bayesian_linear_regression_predict, random_walk_kalman_predict
+from bayes_llm.models import (
+    AdaptiveTwoBranchRegressor,
+    SetLLMStyleInvariantRegressor,
+    build_set_llm_attention_mask,
+    build_set_llm_position_ids,
+)
+from bayes_llm.oracles import bayesian_linear_regression_predict, gp_regression_predict, random_walk_kalman_predict
 from bayes_llm.tasks import (
     ChangepointRegression,
     ExchangeableLinearRegression,
+    GaussianProcessRegression,
     RandomWalkLinearRegression,
     make_torch_generator,
 )
@@ -26,6 +32,7 @@ class TaskGeneratorTests(unittest.TestCase):
             ExchangeableLinearRegression(),
             RandomWalkLinearRegression(),
             ChangepointRegression(min_segment=2),
+            GaussianProcessRegression(kernel="rbf"),
         ]
         for task in tasks:
             with self.subTest(task=task.__class__.__name__):
@@ -78,6 +85,14 @@ class OracleTests(unittest.TestCase):
         )
         self.assertGreater(torch.abs(pred.mean - pred_rev.mean).item(), 0.1)
 
+    def test_gp_oracle_shapes_and_positive_variance(self) -> None:
+        task = GaussianProcessRegression(kernel="matern12", sigma=0.05)
+        batch = task.sample(3, 5, 2, device="cpu", generator=make_torch_generator(9))
+        pred = gp_regression_predict(batch.context_x, batch.context_y, batch.query_x, kernel="matern12", sigma=0.05)
+        self.assertEqual(pred.mean.shape, (3,))
+        self.assertEqual(pred.variance.shape, (3,))
+        self.assertTrue((pred.variance > 0).all())
+
 
 class ModelTests(unittest.TestCase):
     def test_set_llm_style_regressor_is_permutation_invariant(self) -> None:
@@ -109,7 +124,24 @@ class ModelTests(unittest.TestCase):
         )
         self.assertGreater(grad_norm, 0.0)
 
+    def test_set_llm_mask_and_positions_are_set_permutation_equivariant(self) -> None:
+        n_context = 3
+        mask = build_set_llm_attention_mask(1, n_context, device="cpu", dtype=torch.float32)[0, 0]
+        positions = build_set_llm_position_ids(1, n_context, device="cpu")[0]
+        self.assertTrue(torch.equal(positions, torch.tensor([0, 1, 0, 1, 0, 1, 2])))
+        permuted_examples = torch.tensor([2, 0, 1])
+        token_perm = []
+        for example_idx in permuted_examples.tolist():
+            token_perm.extend([2 * example_idx, 2 * example_idx + 1])
+        token_perm.append(2 * n_context)
+        token_perm = torch.tensor(token_perm)
+        permuted_mask = mask[token_perm][:, token_perm]
+        self.assertTrue(torch.equal(mask == 0, permuted_mask == 0))
+        self.assertTrue(torch.equal(positions, positions[token_perm]))
+        self.assertEqual((mask[0, 2] == 0).item(), False)
+        self.assertEqual((mask[0, 1] == 0).item(), True)
+        self.assertTrue((mask[-1] == 0).all())
+
 
 if __name__ == "__main__":
     unittest.main()
-

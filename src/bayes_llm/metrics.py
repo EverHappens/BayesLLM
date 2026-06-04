@@ -113,3 +113,10 @@ def scalar_metrics(pred: Mapping[str, torch.Tensor], target: torch.Tensor) -> di
         values["gate_alpha_std"] = pred["gate_alpha"].std(unbiased=False)
     return {key: float(value.detach().cpu()) for key, value in values.items()}
 
+
+def nearest_neighbor_mean(context_x: torch.Tensor, context_y: torch.Tensor, query_x: torch.Tensor) -> torch.Tensor:
+    if context_x.shape[1] == 0:
+        return torch.zeros_like(query_x[:, 0])
+    dist2 = (context_x - query_x[:, None, :]).square().sum(dim=-1)
+    index = dist2.argmin(dim=1)
+    return context_y.gather(1, index[:, None]).squeeze(1)

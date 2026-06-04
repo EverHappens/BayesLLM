@@ -8,6 +8,12 @@ from typing import Any
 
 import torch
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable: object) -> object:
+        return iterable
+
 from bayes_llm.metrics import (
     gaussian_nll,
     martingale_prediction_stats,
@@ -20,6 +26,7 @@ from bayes_llm.oracles import oracle_for_batch
 from bayes_llm.tasks import (
     ChangepointRegression,
     ExchangeableLinearRegression,
+    GaussianProcessRegression,
     HeteroscedasticTemporalRegression,
     RandomWalkLinearRegression,
     RegressionTask,
@@ -56,6 +63,27 @@ def make_task_from_args(args: argparse.Namespace) -> RegressionTask:
             tau=args.tau,
             sigma_start=args.sigma_start,
             sigma_end=args.sigma_end,
+        )
+    if name in {"gp", "gp_rbf"}:
+        return GaussianProcessRegression(
+            kernel="rbf",
+            amplitude=args.gp_amplitude,
+            lengthscale=args.gp_lengthscale,
+            sigma=args.sigma,
+        )
+    if name in {"gp_matern12", "gp_exponential"}:
+        return GaussianProcessRegression(
+            kernel="matern12",
+            amplitude=args.gp_amplitude,
+            lengthscale=args.gp_lengthscale,
+            sigma=args.sigma,
+        )
+    if name in {"gp_matern32"}:
+        return GaussianProcessRegression(
+            kernel="matern32",
+            amplitude=args.gp_amplitude,
+            lengthscale=args.gp_lengthscale,
+            sigma=args.sigma,
         )
     raise ValueError(f"unknown task: {args.task}")
 
@@ -114,6 +142,8 @@ def evaluate(
             tau=args.tau,
             sigma=args.sigma,
             q=args.q,
+            gp_amplitude=args.gp_amplitude,
+            gp_lengthscale=args.gp_lengthscale,
         )
         if oracle is not None:
             row.update(oracle_distance_metrics(pred, oracle.mean, oracle.variance))
@@ -129,7 +159,19 @@ def evaluate(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train synthetic Bayesian ICL regressors.")
-    parser.add_argument("--task", default="exchangeable", choices=["exchangeable", "random_walk", "changepoint", "heteroscedastic"])
+    parser.add_argument(
+        "--task",
+        default="exchangeable",
+        choices=[
+            "exchangeable",
+            "random_walk",
+            "changepoint",
+            "heteroscedastic",
+            "gp_rbf",
+            "gp_matern12",
+            "gp_matern32",
+        ],
+    )
     parser.add_argument(
         "--model",
         default="qwen_adaptive",
@@ -142,9 +184,11 @@ def build_parser() -> argparse.ArgumentParser:
             "qwen",
             "qwen_set",
             "qwen_adaptive",
+            "qwen_deepset",
             "hf",
             "hf_set",
             "hf_adaptive",
+            "hf_deepset",
         ],
     )
     parser.add_argument("--hf-model-id", default="Qwen/Qwen2.5-0.5B")
@@ -166,6 +210,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tau", type=float, default=1.0)
     parser.add_argument("--sigma", type=float, default=0.1)
     parser.add_argument("--q", type=float, default=0.05)
+    parser.add_argument("--gp-amplitude", type=float, default=1.0)
+    parser.add_argument("--gp-lengthscale", type=float, default=1.0)
     parser.add_argument("--sigma-start", type=float, default=0.3)
     parser.add_argument("--sigma-end", type=float, default=0.05)
     parser.add_argument("--min-segment", type=int, default=2)
@@ -216,7 +262,7 @@ def main(argv: list[str] | None = None) -> None:
         json.dump(config, handle, indent=2, sort_keys=True)
 
     model.train()
-    for step in range(1, args.steps + 1):
+    for step in tqdm(range(1, args.steps + 1)):
         batch = task.sample(
             args.batch_size,
             args.context,

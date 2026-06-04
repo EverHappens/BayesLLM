@@ -9,15 +9,20 @@ description = "GPU-ready synthetic Bayesian ICL experiments for exchangeable and
 requires-python = ">=3.11"
 dependencies = [
   "torch>=2.2",
+  "tqdm>=4.66",
 ]
 
 [project.optional-dependencies]
 hf = [
   "transformers>=4.37",
 ]
+plots = [
+  "matplotlib>=3.8",
+]
 
 [project.scripts]
 bayes-llm-train = "bayes_llm.train:main"
+bayes-llm-plot = "bayes_llm.plot_curves:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

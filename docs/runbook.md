@@ -10,10 +10,10 @@ Work from the project root:
 cd /Users/ever/Desktop/work/codex/bayes_llm
 ```
 
-Install a CUDA-enabled PyTorch build for your machine using the PyTorch install selector. Then install this package with Hugging Face support:
+Install a CUDA-enabled PyTorch build for your machine using the PyTorch install selector. Then install this package with Hugging Face and plotting support:
 
 ```bash
-pip install -e ".[hf]"
+pip install -e ".[hf,plots]"
 ```
 
 If you do not install the package, prefix commands with:
@@ -82,7 +82,32 @@ HF_MODEL_ID="Qwen/Qwen3-0.6B" TASKS="exchangeable" MODELS="qwen" \
 
 By default, `examples/run_gpu_matrix.sh` sets `FREEZE_BACKBONE=1`, so it trains only numeric adapters, regression heads, and the adaptive gate. Set `FREEZE_BACKBONE=0` to fine-tune the whole pretrained model.
 
-Outputs go under `artifacts/gpu_matrix/<task>_<model>/` by default.
+### `examples/plot_learning_curves.sh`
+
+Evaluates analytical references and any trained checkpoints across a grid of demonstration counts, then writes CSV and PNG files:
+
+```bash
+RUN_DIRS="artifacts/gpu_matrix/exchangeable_qwen_set artifacts/gpu_matrix/exchangeable_qwen_adaptive" \
+TASK=exchangeable \
+  bash examples/plot_learning_curves.sh
+```
+
+It produces `eval_curves.csv` plus plots such as:
+
+- `mse_vs_demonstrations.png`
+- `nll_vs_demonstrations.png`
+- `oracle_kl_vs_demonstrations.png`
+- `permutation_mean_var_vs_demonstrations.png`
+- `gate_alpha_mean_vs_demonstrations.png`
+- `martingale_abs_increment_vs_demonstrations.png`
+
+You can also run analytical references only:
+
+```bash
+TASK=gp_rbf DEVICE=cpu bash examples/plot_learning_curves.sh
+```
+
+Training outputs from `examples/run_gpu_matrix.sh` go under `artifacts/gpu_matrix/<task>_<model>/` by default. Plot outputs from `examples/plot_learning_curves.sh` go under `artifacts/plots/<task>/` by default.
 
 ## Direct CLI
 
@@ -112,8 +137,8 @@ python -m bayes_llm.train \
 
 Important flags:
 
-- `--task`: `exchangeable`, `random_walk`, `changepoint`, or `heteroscedastic`.
-- `--model`: use `qwen`, `qwen_set`, or `qwen_adaptive` for pretrained experiments; `regular`, `set`, and `adaptive` are scratch ablations.
+- `--task`: `exchangeable`, `random_walk`, `changepoint`, `heteroscedastic`, `gp_rbf`, `gp_matern12`, or `gp_matern32`.
+- `--model`: use `qwen`, `qwen_set`, or `qwen_adaptive` for pretrained experiments; `qwen_deepset`, `regular`, `set`, and `adaptive` are ablations.
 - `--hf-model-id`: Hugging Face model id for pretrained backbones; default is `Qwen/Qwen2.5-0.5B`.
 - `--freeze-backbone`: freeze the pretrained Qwen/HF transformer and train only adapters/heads/gate.
 - `--device`: `cuda`, `cpu`, `mps`, or `auto`.
@@ -122,6 +147,7 @@ Important flags:
 - `--context`: number of in-context examples.
 - `--x-dim`: regression input dimension.
 - `--tau`, `--sigma`, `--q`: prior, observation noise, and random-walk process variance.
+- `--gp-amplitude`, `--gp-lengthscale`: GP function-prior hyperparameters.
 - `--n-permutations`: number of context permutations for permutation-gap evaluation.
 
 Each run writes:
@@ -166,11 +192,13 @@ These are used for oracle mean/variance distance and KL-style diagnostics.
 Defines the model baselines:
 
 - `PretrainedOrderedRegressor`: ordered pretrained Qwen/HF decoder backbone, selected by `--model qwen`.
-- `PretrainedSetRegressor`: pretrained Qwen/HF backbone applied per example with invariant pooling, selected by `--model qwen_set`.
+- `PretrainedSetRegressor`: Set-LLM-style pretrained Qwen/HF backbone using SetPE positions and a paper-style SetMask, selected by `--model qwen_set`.
 - `PretrainedAdaptiveRegressor`: shared pretrained Qwen/HF backbone with set and ordered paths plus `gate_alpha`, selected by `--model qwen_adaptive`.
-- `PositionAwareTransformerRegressor`, `SetLLMStyleInvariantRegressor`, and `AdaptiveTwoBranchRegressor`: scratch ablations only.
+- `PretrainedDeepSetRegressor`, `PositionAwareTransformerRegressor`, `SetLLMStyleInvariantRegressor`, and `AdaptiveTwoBranchRegressor`: ablations only.
 
 The pretrained models do not serialize tensors into text. They feed learned numeric prompt embeddings through `AutoModel.from_pretrained(...)` via `inputs_embeds`, reusing the pretrained transformer weights while training small numeric adapters and regression heads.
+
+For `qwen_set`, the numeric prompt is `[x1, y1, ..., xN, yN, query]`. Role embeddings distinguish predictor, target, and query tokens. SetPE reuses positions across demonstrations, and SetMask permits attention within each demonstration while allowing the query token to attend to all demonstrations. Set-LLM is used here as an architectural invariance mechanism, not as an ICL framework by itself; the ICL setup comes from our synthetic demonstrations plus held-out query. This is closer to the Set-LLM mechanism than the old DeepSets-style mean-pooled branch because the query representation is produced by the pretrained attention stack under the set mask.
 
 All models expose:
 
@@ -199,6 +227,17 @@ Computes:
 - oracle mean/variance distance
 - Gaussian KL from oracle to model
 - martingale-style predictive drift on exchangeable tasks
+
+### `src/bayes_llm/plot_curves.py`
+
+Evaluates checkpoints across context counts and plots:
+
+- analytical oracle MSE/NLL from closed-form Bayesian linear, Kalman, changepoint, or GP regression
+- 1-nearest-neighbor MSE reference, following the kind of upper-reference curve used in function-learning work
+- trained model MSE/NLL
+- permutation gap
+- oracle KL / oracle mean error
+- gate behavior for adaptive models
 
 ### `src/bayes_llm/train.py`
 

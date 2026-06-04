@@ -257,6 +257,51 @@ def _hidden_size(backbone: nn.Module) -> int:
     raise ValueError("could not infer hidden size from Hugging Face backbone config")
 
 
+def build_set_llm_position_ids(
+    batch_size: int,
+    n_context: int,
+    *,
+    device: torch.device | str,
+) -> torch.Tensor:
+    """SetPE positions for [x1, y1, ..., xN, yN, query]."""
+
+    dev = torch.device(device)
+    set_positions = torch.arange(2 * n_context, device=dev, dtype=torch.long) % 2
+    query_position = torch.tensor([2], device=dev, dtype=torch.long)
+    positions = torch.cat([set_positions, query_position], dim=0)
+    return positions.unsqueeze(0).expand(batch_size, -1)
+
+
+def build_set_llm_attention_mask(
+    batch_size: int,
+    n_context: int,
+    *,
+    device: torch.device | str,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Paper-style SetMask for [x1, y1, ..., xN, yN, query].
+
+    Tokens from the same demonstration can attend each other. Tokens from
+    different demonstrations cannot attend each other. The query attends to
+    every demonstration token; demonstration tokens do not attend to the query.
+    """
+
+    dev = torch.device(device)
+    length = 2 * n_context + 1
+    blocked = -torch.finfo(dtype).max
+    mask = torch.full((length, length), blocked, device=dev, dtype=dtype)
+    token_index = torch.arange(2 * n_context, device=dev)
+    element_id = token_index // 2
+    same_element = element_id[:, None] == element_id[None, :]
+    mask[: 2 * n_context, : 2 * n_context] = torch.where(
+        same_element,
+        torch.zeros((), device=dev, dtype=dtype),
+        torch.full((), blocked, device=dev, dtype=dtype),
+    )
+    mask[-1, :] = 0.0
+    return mask.unsqueeze(0).unsqueeze(1).expand(batch_size, 1, length, length)
+
+
 class PretrainedCausalBackboneEncoder(nn.Module):
     """Numeric ICL encoder that reuses a pretrained decoder backbone."""
 
@@ -278,6 +323,9 @@ class PretrainedCausalBackboneEncoder(nn.Module):
         self.ordered_example_marker = nn.Parameter(torch.zeros(self.hidden_dim))
         self.ordered_query_marker = nn.Parameter(torch.zeros(self.hidden_dim))
         self.local_position = nn.Parameter(torch.zeros(2, self.hidden_dim))
+        self.x_role = nn.Parameter(torch.zeros(self.hidden_dim))
+        self.y_role = nn.Parameter(torch.zeros(self.hidden_dim))
+        self.query_role = nn.Parameter(torch.zeros(self.hidden_dim))
         self.set_norm = nn.LayerNorm(self.hidden_dim)
         self.query_norm = nn.LayerNorm(self.hidden_dim)
         self.freeze_backbone = freeze_backbone
@@ -291,6 +339,17 @@ class PretrainedCausalBackboneEncoder(nn.Module):
         if self.freeze_backbone:
             self.backbone.eval()
         return self
+
+    def _last_hidden_state(self, outputs: object) -> torch.Tensor:
+        last_hidden = getattr(outputs, "last_hidden_state", None)
+        if last_hidden is not None:
+            return last_hidden
+        hidden_states = getattr(outputs, "hidden_states", None)
+        if hidden_states is not None:
+            return hidden_states[-1]
+        if isinstance(outputs, tuple) and outputs:
+            return outputs[0]
+        raise RuntimeError("Hugging Face backbone did not return hidden states")
 
     def _run_backbone(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
         attention_mask = torch.ones(
@@ -311,13 +370,60 @@ class PretrainedCausalBackboneEncoder(nn.Module):
                 attention_mask=attention_mask,
                 return_dict=True,
             )
-        last_hidden = getattr(outputs, "last_hidden_state", None)
-        if last_hidden is None:
-            hidden_states = getattr(outputs, "hidden_states", None)
-            if hidden_states is None:
-                raise RuntimeError("Hugging Face backbone did not return hidden states")
-            last_hidden = hidden_states[-1]
-        return last_hidden
+        return self._last_hidden_state(outputs)
+
+    def _run_backbone_with_set_mask(
+        self,
+        inputs_embeds: torch.Tensor,
+        mask_4d: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        target = self.backbone
+        try:
+            outputs = target(
+                inputs_embeds=inputs_embeds,
+                attention_mask=mask_4d,
+                position_ids=position_ids,
+                use_cache=False,
+                return_dict=True,
+            )
+            return self._last_hidden_state(outputs)
+        except TypeError:
+            pass
+
+        try:
+            outputs = target(
+                inputs_embeds=inputs_embeds,
+                attention_mask=None,
+                causal_mask=mask_4d,
+                position_ids=position_ids,
+                use_cache=False,
+                return_dict=True,
+            )
+            return self._last_hidden_state(outputs)
+        except TypeError:
+            pass
+
+        base_model = getattr(target, "model", target)
+        original_update = getattr(base_model, "_update_causal_mask", None)
+        if original_update is None:
+            raise RuntimeError("backbone does not expose a compatible custom-mask path")
+
+        def custom_update(*args: object, **kwargs: object) -> torch.Tensor:
+            return mask_4d
+
+        base_model._update_causal_mask = custom_update
+        try:
+            outputs = base_model(
+                inputs_embeds=inputs_embeds,
+                attention_mask=None,
+                position_ids=position_ids,
+                use_cache=False,
+                return_dict=True,
+            )
+            return self._last_hidden_state(outputs)
+        finally:
+            base_model._update_causal_mask = original_update
 
     def encode_ordered(self, context_x: torch.Tensor, context_y: torch.Tensor, query_x: torch.Tensor) -> torch.Tensor:
         examples = torch.cat([context_x, context_y.unsqueeze(-1)], dim=-1)
@@ -339,6 +445,23 @@ class PretrainedCausalBackboneEncoder(nn.Module):
         local_hidden = self._run_backbone(local_tokens).mean(dim=1)
         example_hidden = local_hidden.reshape(batch_size, n_context, self.hidden_dim)
         return self.set_norm(example_hidden.mean(dim=1))
+
+    def encode_set_llm(self, context_x: torch.Tensor, context_y: torch.Tensor, query_x: torch.Tensor) -> torch.Tensor:
+        batch_size, n_context, _ = context_x.shape
+        x_token = self.local_x_adapter(context_x) + self.x_role[None, None, :]
+        y_token = self.local_y_adapter(context_y.unsqueeze(-1)) + self.y_role[None, None, :]
+        set_tokens = torch.stack([x_token, y_token], dim=2).reshape(batch_size, 2 * n_context, self.hidden_dim)
+        query_token = self.query_adapter(query_x).unsqueeze(1) + self.query_role[None, None, :]
+        tokens = torch.cat([set_tokens, query_token], dim=1)
+        mask = build_set_llm_attention_mask(
+            batch_size,
+            n_context,
+            device=context_x.device,
+            dtype=tokens.dtype,
+        )
+        position_ids = build_set_llm_position_ids(batch_size, n_context, device=context_x.device)
+        hidden = self._run_backbone_with_set_mask(tokens, mask, position_ids)
+        return self.query_norm(hidden[:, -1])
 
 
 class PretrainedOrderedRegressor(nn.Module):
@@ -365,8 +488,8 @@ class PretrainedOrderedRegressor(nn.Module):
         return self.head(self.encoder.encode_ordered(context_x, context_y, query_x))
 
 
-class PretrainedSetRegressor(nn.Module):
-    """Permutation-invariant regressor using a pretrained backbone per example."""
+class PretrainedDeepSetRegressor(nn.Module):
+    """DeepSets-style pretrained ablation using per-example backbone calls."""
 
     def __init__(
         self,
@@ -391,6 +514,30 @@ class PretrainedSetRegressor(nn.Module):
         return self.head(torch.cat([context, query], dim=-1))
 
 
+class PretrainedSetRegressor(nn.Module):
+    """Set-LLM-style mask/position mechanism applied to ICL prompts."""
+
+    def __init__(
+        self,
+        x_dim: int,
+        model_id: str = "Qwen/Qwen2.5-0.5B",
+        *,
+        freeze_backbone: bool = False,
+        trust_remote_code: bool = False,
+    ) -> None:
+        super().__init__()
+        self.encoder = PretrainedCausalBackboneEncoder(
+            x_dim,
+            model_id,
+            freeze_backbone=freeze_backbone,
+            trust_remote_code=trust_remote_code,
+        )
+        self.head = GaussianHead(self.encoder.hidden_dim)
+
+    def forward(self, context_x: torch.Tensor, context_y: torch.Tensor, query_x: torch.Tensor) -> dict[str, torch.Tensor]:
+        return self.head(self.encoder.encode_set_llm(context_x, context_y, query_x))
+
+
 class PretrainedAdaptiveRegressor(nn.Module):
     """Adaptive set/ordered regressor with a shared pretrained Qwen/HF backbone."""
 
@@ -410,7 +557,7 @@ class PretrainedAdaptiveRegressor(nn.Module):
             trust_remote_code=trust_remote_code,
         )
         hidden_dim = self.encoder.hidden_dim
-        self.set_head = GaussianHead(2 * hidden_dim)
+        self.set_head = GaussianHead(hidden_dim)
         self.ordered_head = GaussianHead(hidden_dim)
         self.gate = nn.Sequential(
             nn.Linear(3 * hidden_dim, hidden_dim),
@@ -419,10 +566,10 @@ class PretrainedAdaptiveRegressor(nn.Module):
         )
 
     def forward(self, context_x: torch.Tensor, context_y: torch.Tensor, query_x: torch.Tensor) -> dict[str, torch.Tensor]:
-        set_context = self.encoder.encode_set(context_x, context_y)
+        set_context = self.encoder.encode_set_llm(context_x, context_y, query_x)
         ordered_context = self.encoder.encode_ordered(context_x, context_y, query_x)
         query = self.encoder.encode_query(query_x)
-        set_pred = self.set_head(torch.cat([set_context, query], dim=-1))
+        set_pred = self.set_head(set_context)
         ordered_pred = self.ordered_head(ordered_context)
         alpha = torch.sigmoid(self.gate(torch.cat([set_context, ordered_context, query], dim=-1))).squeeze(-1)
         mean = alpha * set_pred["mean"] + (1.0 - alpha) * ordered_pred["mean"]
@@ -466,6 +613,13 @@ def make_model(config: ModelConfig) -> nn.Module:
         )
     if name in {"qwen_set", "hf_set", "pretrained_set"}:
         return PretrainedSetRegressor(
+            config.x_dim,
+            model_id=config.hf_model_id,
+            freeze_backbone=config.freeze_backbone,
+            trust_remote_code=config.trust_remote_code,
+        )
+    if name in {"qwen_deepset", "hf_deepset", "pretrained_deepset"}:
+        return PretrainedDeepSetRegressor(
             config.x_dim,
             model_id=config.hf_model_id,
             freeze_backbone=config.freeze_backbone,

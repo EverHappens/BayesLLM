@@ -3,6 +3,7 @@
 from bayes_llm.tasks import (
     ChangepointRegression,
     ExchangeableLinearRegression,
+    GaussianProcessRegression,
     HeteroscedasticTemporalRegression,
     RandomWalkLinearRegression,
     RegressionBatch,
@@ -13,10 +14,10 @@ from bayes_llm.tasks import (
 __all__ = [
     "ChangepointRegression",
     "ExchangeableLinearRegression",
+    "GaussianProcessRegression",
     "HeteroscedasticTemporalRegression",
     "RandomWalkLinearRegression",
     "RegressionBatch",
     "make_task",
     "make_torch_generator",
 ]
-
