@@ -26,7 +26,7 @@ N_HEADS="${N_HEADS:-4}"
 N_LAYERS="${N_LAYERS:-2}"
 OUT_ROOT="${OUT_ROOT:-artifacts/gpu_matrix}"
 TASKS="${TASKS:-exchangeable random_walk changepoint}"
-MODELS="${MODELS:-qwen qwen_set qwen_adaptive}"
+MODELS="${MODELS:-qwen_text qwen_set qwen_adaptive}"
 HF_MODEL_ID="${HF_MODEL_ID:-Qwen/Qwen2.5-0.5B}"
 FREEZE_BACKBONE="${FREEZE_BACKBONE:-1}"
 COMPILE="${COMPILE:-0}"
@@ -49,6 +49,7 @@ for task in $TASKS; do
       --task "$task" \
       --model "$model" \
       --hf-model-id "$HF_MODEL_ID" \
+      --prompt-style compact \
       --device "$DEVICE" \
       --amp "$AMP" \
       --steps "$STEPS" \

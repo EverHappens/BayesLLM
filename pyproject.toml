@@ -23,6 +23,8 @@ plots = [
 [project.scripts]
 bayes-llm-train = "bayes_llm.train:main"
 bayes-llm-plot = "bayes_llm.plot_curves:main"
+bayes-llm-preview = "bayes_llm.prompting:main"
+bayes-llm-function-fit = "bayes_llm.function_fit:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

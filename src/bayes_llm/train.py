@@ -174,7 +174,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--model",
-        default="qwen_adaptive",
+        default="qwen_text",
         choices=[
             "regular",
             "ordered",
@@ -182,10 +182,12 @@ def build_parser() -> argparse.ArgumentParser:
             "set_llm",
             "adaptive",
             "qwen",
+            "qwen_text",
             "qwen_set",
             "qwen_adaptive",
             "qwen_deepset",
             "hf",
+            "hf_text",
             "hf_set",
             "hf_adaptive",
             "hf_deepset",
@@ -194,6 +196,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hf-model-id", default="Qwen/Qwen2.5-0.5B")
     parser.add_argument("--freeze-backbone", action="store_true")
     parser.add_argument("--trust-remote-code", action="store_true")
+    parser.add_argument("--prompt-precision", type=int, default=4)
+    parser.add_argument("--max-prompt-length", type=int, default=1024)
+    parser.add_argument("--prompt-ordered", action="store_true", default=True)
+    parser.add_argument("--prompt-unordered", action="store_false", dest="prompt_ordered")
+    parser.add_argument("--prompt-style", default="compact", choices=["compact", "human"])
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
     parser.add_argument("--amp", default="off", choices=["off", "fp16", "bf16"])
     parser.add_argument("--compile", action="store_true", help="Wrap the model with torch.compile when available.")
@@ -245,6 +252,11 @@ def main(argv: list[str] | None = None) -> None:
             hf_model_id=args.hf_model_id,
             freeze_backbone=args.freeze_backbone,
             trust_remote_code=args.trust_remote_code,
+            prompt_precision=args.prompt_precision,
+            max_prompt_length=args.max_prompt_length,
+            prompt_ordered=args.prompt_ordered,
+            prompt_style=args.prompt_style,
+            task_name=args.task,
         )
     ).to(device)
     if args.compile:

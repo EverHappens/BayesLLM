@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from bayes_llm.metrics import gaussian_nll
+from bayes_llm.function_fit import evaluate_named_function, make_feature_matrix
 from bayes_llm.models import (
     AdaptiveTwoBranchRegressor,
     SetLLMStyleInvariantRegressor,
@@ -17,6 +18,7 @@ from bayes_llm.models import (
     build_set_llm_position_ids,
 )
 from bayes_llm.oracles import bayesian_linear_regression_predict, gp_regression_predict, random_walk_kalman_predict
+from bayes_llm.prompting import format_batch_prompt
 from bayes_llm.tasks import (
     ChangepointRegression,
     ExchangeableLinearRegression,
@@ -141,6 +143,35 @@ class ModelTests(unittest.TestCase):
         self.assertEqual((mask[0, 2] == 0).item(), False)
         self.assertEqual((mask[0, 1] == 0).item(), True)
         self.assertTrue((mask[-1] == 0).all())
+
+
+class PromptingTests(unittest.TestCase):
+    def test_prompt_formatter_shows_demonstrations_and_query(self) -> None:
+        batch = ExchangeableLinearRegression().sample(1, 2, 2, device="cpu", generator=make_torch_generator(12))
+        prompt = format_batch_prompt(batch, task_name="exchangeable", precision=2)
+        self.assertIn("Task: exchangeable regression.", prompt)
+        self.assertIn("Example 1: x =", prompt)
+        self.assertIn("Example 2: x =", prompt)
+        self.assertIn("Query: x =", prompt)
+
+    def test_compact_prompt_formatter_matches_tokenized_model_style(self) -> None:
+        batch = ExchangeableLinearRegression().sample(1, 2, 2, device="cpu", generator=make_torch_generator(13))
+        prompt = format_batch_prompt(batch, task_name="exchangeable", precision=2, style="compact")
+        self.assertIn("Infer the scalar function from examples.", prompt)
+        self.assertIn("x=", prompt)
+        self.assertIn("-> y=", prompt)
+        self.assertTrue(prompt.rstrip().endswith("-> y="))
+
+
+class FunctionFitTests(unittest.TestCase):
+    def test_named_cosine_function_and_feature_matrix(self) -> None:
+        x = torch.tensor([0.0, torch.pi / 2, torch.pi])
+        y = evaluate_named_function("cosine", x)
+        self.assertTrue(torch.allclose(y, torch.tensor([1.0, 0.0, -1.0]), atol=1e-6))
+        features = make_feature_matrix(x, x_dim=3)
+        self.assertEqual(features.shape, (3, 3))
+        self.assertTrue(torch.allclose(features[:, 0], x))
+        self.assertTrue(torch.equal(features[:, 1:], torch.zeros(3, 2)))
 
 
 if __name__ == "__main__":

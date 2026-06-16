@@ -109,38 +109,83 @@ TASK=gp_rbf DEVICE=cpu bash examples/plot_learning_curves.sh
 
 Training outputs from `examples/run_gpu_matrix.sh` go under `artifacts/gpu_matrix/<task>_<model>/` by default. Plot outputs from `examples/plot_learning_curves.sh` go under `artifacts/plots/<task>/` by default.
 
+### `examples/plot_function_fit.sh`
+
+Shows qualitative function approximation for a concrete 1D function such as cosine. It loads one or more checkpoints, uses fixed demonstration points, predicts over a dense grid, and writes `function_fit.csv` plus `function_fit.png` when `matplotlib` is installed.
+
+```bash
+RUN_DIRS="artifacts/gp_rbf_qwen_text" FUNCTION=cosine \
+  bash examples/plot_function_fit.sh
+```
+
+Useful overrides:
+
+```bash
+FUNCTION=sine \
+DEMO_X="-3,-1,0,1,3" \
+X_MIN=-4 \
+X_MAX=4 \
+RUN_DIRS="artifacts/gp_rbf_qwen_text artifacts/gp_rbf_qwen_set" \
+  bash examples/plot_function_fit.sh
+```
+
 ## Direct CLI
 
-The underlying entrypoint is:
+The underlying training entrypoint is:
 
 ```bash
 python -m bayes_llm.train
 ```
 
-Example:
+Preview the human-readable ICL prompt for one generated batch:
+
+```bash
+python -m bayes_llm.prompting --task exchangeable --context 4 --x-dim 3
+```
+
+This prints a prompt such as:
+
+```text
+Task: exchangeable regression.
+The demonstrations form an unordered set. The order of examples is arbitrary.
+Given demonstration pairs (x, y), predict the scalar y for the query x.
+
+Example 1: x = [...], y = ...
+Example 2: x = [...], y = ...
+
+Query: x = [...]
+Answer with the predicted scalar y.
+```
+
+That text prompt is the input format for `qwen_text`. The `qwen`, `qwen_set`, and `qwen_adaptive` architectural ablations use learned numeric prompt embeddings and feed them to the pretrained model through `inputs_embeds`.
+
+Paper-style tokenized prompt example:
 
 ```bash
 python -m bayes_llm.train \
-  --task random_walk \
-  --model qwen_adaptive \
+  --task gp_rbf \
+  --model qwen_text \
   --hf-model-id Qwen/Qwen2.5-0.5B \
   --device cuda \
   --amp bf16 \
-  --compile \
+  --freeze-backbone \
   --steps 5000 \
   --batch-size 32 \
   --context 16 \
   --x-dim 8 \
-  --freeze-backbone \
-  --out-dir artifacts/random_walk_adaptive
+  --prompt-style compact \
+  --out-dir artifacts/gp_rbf_qwen_text
 ```
 
 Important flags:
 
 - `--task`: `exchangeable`, `random_walk`, `changepoint`, `heteroscedastic`, `gp_rbf`, `gp_matern12`, or `gp_matern32`.
-- `--model`: use `qwen`, `qwen_set`, or `qwen_adaptive` for pretrained experiments; `qwen_deepset`, `regular`, `set`, and `adaptive` are ablations.
+- `--model`: use `qwen_text` when you want the whole numerical ICL prompt tokenized like function-learning prompting papers. Use `qwen_set` for the Set-LLM-inspired masked embedding architecture and `qwen_adaptive` for the hybrid architecture. `qwen`, `qwen_deepset`, `regular`, `set`, and `adaptive` are ablations.
 - `--hf-model-id`: Hugging Face model id for pretrained backbones; default is `Qwen/Qwen2.5-0.5B`.
 - `--freeze-backbone`: freeze the pretrained Qwen/HF transformer and train only adapters/heads/gate.
+- `--prompt-style`: `compact` is the default tokenized model format; `human` is longer and mostly useful for inspection.
+- `--prompt-precision`: number of decimal places rendered into tokenized prompts.
+- `--max-prompt-length`: tokenizer truncation length for `qwen_text`.
 - `--device`: `cuda`, `cpu`, `mps`, or `auto`.
 - `--amp`: `bf16`, `fp16`, or `off`; use `bf16` first on modern GPUs.
 - `--compile`: enables `torch.compile`.
@@ -192,11 +237,15 @@ These are used for oracle mean/variance distance and KL-style diagnostics.
 Defines the model baselines:
 
 - `PretrainedOrderedRegressor`: ordered pretrained Qwen/HF decoder backbone, selected by `--model qwen`.
+- `PretrainedTextPromptRegressor`: full text-tokenized prompt baseline, selected by `--model qwen_text`.
 - `PretrainedSetRegressor`: Set-LLM-style pretrained Qwen/HF backbone using SetPE positions and a paper-style SetMask, selected by `--model qwen_set`.
 - `PretrainedAdaptiveRegressor`: shared pretrained Qwen/HF backbone with set and ordered paths plus `gate_alpha`, selected by `--model qwen_adaptive`.
 - `PretrainedDeepSetRegressor`, `PositionAwareTransformerRegressor`, `SetLLMStyleInvariantRegressor`, and `AdaptiveTwoBranchRegressor`: ablations only.
 
-The pretrained models do not serialize tensors into text. They feed learned numeric prompt embeddings through `AutoModel.from_pretrained(...)` via `inputs_embeds`, reusing the pretrained transformer weights while training small numeric adapters and regression heads.
+There are now two input-processing families:
+
+- `qwen_text` serializes the entire synthetic ICL prompt into text, tokenizes it with `AutoTokenizer`, runs Qwen on `input_ids`, and regresses from the last prompt-token hidden state. This is the closest path to "In-Context Function Learning in Large Language Models".
+- `qwen`, `qwen_set`, and `qwen_adaptive` do not serialize tensors into text. They feed learned numeric prompt embeddings through `AutoModel.from_pretrained(...)` via `inputs_embeds`, reusing the pretrained transformer weights while training small numeric adapters and regression heads.
 
 For `qwen_set`, the numeric prompt is `[x1, y1, ..., xN, yN, query]`. Role embeddings distinguish predictor, target, and query tokens. SetPE reuses positions across demonstrations, and SetMask permits attention within each demonstration while allowing the query token to attend to all demonstrations. Set-LLM is used here as an architectural invariance mechanism, not as an ICL framework by itself; the ICL setup comes from our synthetic demonstrations plus held-out query. This is closer to the Set-LLM mechanism than the old DeepSets-style mean-pooled branch because the query representation is produced by the pretrained attention stack under the set mask.
 
@@ -238,6 +287,10 @@ Evaluates checkpoints across context counts and plots:
 - permutation gap
 - oracle KL / oracle mean error
 - gate behavior for adaptive models
+
+### `src/bayes_llm/function_fit.py`
+
+Plots qualitative fixed-function fits. Supported functions are `cosine`, `sine`, `linear`, `quadratic`, `cubic`, `abs`, and `step`. This is useful after training on GP/function-learning tasks: it shows whether the checkpoint interpolates or extrapolates a concrete function family in a way that is visually sensible.
 
 ### `src/bayes_llm/train.py`
 

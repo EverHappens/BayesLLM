@@ -91,6 +91,11 @@ def load_model_from_run(run_dir: Path, device: torch.device, max_context: int) -
             hf_model_id=str(config.get("hf_model_id", "Qwen/Qwen2.5-0.5B")),
             freeze_backbone=bool(config.get("freeze_backbone", False)),
             trust_remote_code=bool(config.get("trust_remote_code", False)),
+            prompt_precision=int(config.get("prompt_precision", 4)),
+            max_prompt_length=int(config.get("max_prompt_length", 1024)),
+            prompt_ordered=bool(config.get("prompt_ordered", True)),
+            prompt_style=str(config.get("prompt_style", "compact")),
+            task_name=str(config.get("task", "")),
         )
     ).to(device)
     checkpoint = torch.load(run_dir / "checkpoint.pt", map_location=device)

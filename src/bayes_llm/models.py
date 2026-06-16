@@ -6,6 +6,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from bayes_llm.prompting import format_regression_prompt
+
 
 def _mlp(input_dim: int, hidden_dim: int, output_dim: int, depth: int = 2) -> nn.Sequential:
     if depth < 1:
@@ -248,6 +250,20 @@ def _load_hf_backbone(model_id: str, trust_remote_code: bool) -> nn.Module:
     return AutoModel.from_pretrained(model_id, trust_remote_code=trust_remote_code)
 
 
+def _load_hf_tokenizer(model_id: str, trust_remote_code: bool):
+    try:
+        from transformers import AutoTokenizer
+    except ImportError as exc:
+        raise RuntimeError(
+            "Tokenized Hugging Face models require transformers. "
+            "Install with `pip install -e '.[hf]'` or `pip install transformers`."
+        ) from exc
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=trust_remote_code)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer
+
+
 def _hidden_size(backbone: nn.Module) -> int:
     config = getattr(backbone, "config", None)
     for name in ("hidden_size", "n_embd", "d_model"):
@@ -426,6 +442,7 @@ class PretrainedCausalBackboneEncoder(nn.Module):
             base_model._update_causal_mask = original_update
 
     def encode_ordered(self, context_x: torch.Tensor, context_y: torch.Tensor, query_x: torch.Tensor) -> torch.Tensor:
+        # Numeric prompt, not text tokenization: each demonstration is projected to one learned embedding.
         examples = torch.cat([context_x, context_y.unsqueeze(-1)], dim=-1)
         example_tokens = self.example_adapter(examples) + self.ordered_example_marker[None, None, :]
         query_token = self.query_adapter(query_x).unsqueeze(1) + self.ordered_query_marker[None, None, :]
@@ -448,6 +465,7 @@ class PretrainedCausalBackboneEncoder(nn.Module):
 
     def encode_set_llm(self, context_x: torch.Tensor, context_y: torch.Tensor, query_x: torch.Tensor) -> torch.Tensor:
         batch_size, n_context, _ = context_x.shape
+        # Numeric Set-LLM prompt: [x1, y1, ..., xN, yN, query] in embedding space.
         x_token = self.local_x_adapter(context_x) + self.x_role[None, None, :]
         y_token = self.local_y_adapter(context_y.unsqueeze(-1)) + self.y_role[None, None, :]
         set_tokens = torch.stack([x_token, y_token], dim=2).reshape(batch_size, 2 * n_context, self.hidden_dim)
@@ -588,6 +606,104 @@ class PretrainedAdaptiveRegressor(nn.Module):
         }
 
 
+class PretrainedTextPromptRegressor(nn.Module):
+    """Tokenize full numerical ICL prompts, then regress from the final hidden state."""
+
+    def __init__(
+        self,
+        x_dim: int,
+        model_id: str = "Qwen/Qwen2.5-0.5B",
+        *,
+        freeze_backbone: bool = True,
+        trust_remote_code: bool = False,
+        prompt_precision: int = 4,
+        max_prompt_length: int = 1024,
+        prompt_ordered: bool = True,
+        prompt_style: str = "compact",
+        task_name: str | None = None,
+    ) -> None:
+        super().__init__()
+        del x_dim
+        self.tokenizer = _load_hf_tokenizer(model_id, trust_remote_code=trust_remote_code)
+        self.backbone = _load_hf_backbone(model_id, trust_remote_code=trust_remote_code)
+        self.hidden_dim = _hidden_size(self.backbone)
+        self.head = GaussianHead(self.hidden_dim)
+        self.prompt_precision = prompt_precision
+        self.max_prompt_length = max_prompt_length
+        self.prompt_ordered = prompt_ordered
+        self.prompt_style = prompt_style
+        self.task_name = task_name
+        self.freeze_backbone = freeze_backbone
+        if freeze_backbone:
+            for parameter in self.backbone.parameters():
+                parameter.requires_grad_(False)
+            self.backbone.eval()
+
+    def train(self, mode: bool = True) -> "PretrainedTextPromptRegressor":
+        super().train(mode)
+        if self.freeze_backbone:
+            self.backbone.eval()
+        return self
+
+    def _prompts(
+        self,
+        context_x: torch.Tensor,
+        context_y: torch.Tensor,
+        query_x: torch.Tensor,
+    ) -> list[str]:
+        return [
+            format_regression_prompt(
+                context_x[index],
+                context_y[index],
+                query_x[index],
+                task_name=self.task_name,
+                precision=self.prompt_precision,
+                ordered=self.prompt_ordered,
+                style=self.prompt_style,
+            )
+            for index in range(context_x.shape[0])
+        ]
+
+    def _last_hidden_state(self, outputs: object) -> torch.Tensor:
+        last_hidden = getattr(outputs, "last_hidden_state", None)
+        if last_hidden is not None:
+            return last_hidden
+        hidden_states = getattr(outputs, "hidden_states", None)
+        if hidden_states is not None:
+            return hidden_states[-1]
+        if isinstance(outputs, tuple) and outputs:
+            return outputs[0]
+        raise RuntimeError("Hugging Face backbone did not return hidden states")
+
+    def forward(self, context_x: torch.Tensor, context_y: torch.Tensor, query_x: torch.Tensor) -> dict[str, torch.Tensor]:
+        prompts = self._prompts(context_x, context_y, query_x)
+        encoded = self.tokenizer(
+            prompts,
+            padding=True,
+            truncation=True,
+            max_length=self.max_prompt_length,
+            return_tensors="pt",
+        )
+        encoded = {key: value.to(context_x.device) for key, value in encoded.items()}
+        if self.freeze_backbone:
+            with torch.no_grad():
+                try:
+                    outputs = self.backbone(**encoded, use_cache=False, return_dict=True)
+                except TypeError:
+                    outputs = self.backbone(**encoded, return_dict=True)
+                hidden = self._last_hidden_state(outputs).detach()
+        else:
+            try:
+                outputs = self.backbone(**encoded, use_cache=False, return_dict=True)
+            except TypeError:
+                outputs = self.backbone(**encoded, return_dict=True)
+            hidden = self._last_hidden_state(outputs)
+        final_index = encoded["attention_mask"].sum(dim=1).clamp_min(1) - 1
+        batch_index = torch.arange(hidden.shape[0], device=hidden.device)
+        final_hidden = hidden[batch_index, final_index]
+        return self.head(final_hidden)
+
+
 @dataclass(frozen=True)
 class ModelConfig:
     model: str
@@ -600,6 +716,11 @@ class ModelConfig:
     hf_model_id: str = "Qwen/Qwen2.5-0.5B"
     freeze_backbone: bool = False
     trust_remote_code: bool = False
+    prompt_precision: int = 4
+    max_prompt_length: int = 1024
+    prompt_ordered: bool = True
+    prompt_style: str = "compact"
+    task_name: str | None = None
 
 
 def make_model(config: ModelConfig) -> nn.Module:
@@ -610,6 +731,18 @@ def make_model(config: ModelConfig) -> nn.Module:
             model_id=config.hf_model_id,
             freeze_backbone=config.freeze_backbone,
             trust_remote_code=config.trust_remote_code,
+        )
+    if name in {"qwen_text", "hf_text", "pretrained_text", "text"}:
+        return PretrainedTextPromptRegressor(
+            config.x_dim,
+            model_id=config.hf_model_id,
+            freeze_backbone=config.freeze_backbone,
+            trust_remote_code=config.trust_remote_code,
+            prompt_precision=config.prompt_precision,
+            max_prompt_length=config.max_prompt_length,
+            prompt_ordered=config.prompt_ordered,
+            prompt_style=config.prompt_style,
+            task_name=config.task_name,
         )
     if name in {"qwen_set", "hf_set", "pretrained_set"}:
         return PretrainedSetRegressor(
